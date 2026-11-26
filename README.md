@@ -38,6 +38,22 @@ To find the calling client, macOS compares terminal input times. Linux hides tho
 are compared before and after the fzf selection instead. On Linux, `-s` and a path
 argument (nothing is typed while the script runs) move all attached clients.
 
+### Hydrate files
+When a new workspace is created, `<dir>/.herdr-sessionizer` (or else `~/.herdr-sessionizer`)
+is sourced in the workspace's first pane, like tmux-sessionizer's `.tmux-sessionizer`.
+It runs in the pane's shell, asynchronously, so herdr-sessionizer waits (up to 1 second)
+until the file runs `herdr-sessionizer --ready [tab_id]`, then switches to `tab_id`
+(or to the first tab). Call it before any blocking command such as `vim .`.
+Create tabs with `--no-focus`: a focus change here would move every attached client.
+
+```bash
+# file: ~/.herdr-sessionizer
+tab=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$PWD" --label scratch --no-focus |
+    jq -r '.result.tab.tab_id // empty')
+herdr-sessionizer --ready "$tab"   # show the scratch tab; plain --ready shows the first tab
+vim .
+```
+
 ## Session Commands
 Session commands are for you to write / navigate without using herdr navigation commands.
 They are meant to be used with zsh/vim remaps.

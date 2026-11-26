@@ -68,6 +68,8 @@ session_idx=""
 session_cmd=""
 user_selected=""
 split_type=""
+ready_mode=""
+ready_tab=""
 VERSION="0.1.0"
 
 while [[ "$#" -gt 0 ]]; do
@@ -79,7 +81,16 @@ while [[ "$#" -gt 0 ]]; do
         echo "  -s, --session <name>   session command index."
         echo "  --vsplit               Create vertical split (horizontal layout) for session command"
         echo "  --hsplit               Create horizontal split (vertical layout) for session command"
+        echo "  --ready [tab_id]       From a hydrate file: done hydrating, switch to tab_id if given"
         exit 0
+        ;;
+    --ready)
+        ready_mode=1
+        # Optional tab id; an empty argument (e.g. a failed tab create) is accepted too.
+        if [[ $# -gt 1 && $2 != -* ]]; then
+            ready_tab="$2"
+            shift
+        fi
         ;;
     -s | --session)
         session_idx="$2"
@@ -120,6 +131,17 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 log "herdr-sessionizer($VERSION): idx=$session_idx cmd=$session_cmd user_selected=$user_selected split_type=$split_type log=$TS_LOG log_file=$TS_LOG_FILE"
+
+# Called from a hydrate file (see run_hydrate_file). HS_READY names the FIFO the waiting
+# herdr-sessionizer reads; it is a FIFO only while that wait lasts.
+if [[ -n $ready_mode ]]; then
+    if [[ -p $HS_READY ]]; then
+        # Opened read-write so the write never blocks, even if the reader gave up.
+        printf '%s\n' "$ready_tab" 1<>"$HS_READY"
+        log "ready: tab=$ready_tab"
+    fi
+    exit 0
+fi
 
 # Validate split options are only used with session commands
 if [[ -n "$split_type" && -z "$session_idx" ]]; then
@@ -473,17 +495,48 @@ pane_run() {
     herdr pane run "$1" " $2" >/dev/null
 }
 
+# Tab the hydrate file asked to show (`herdr-sessionizer --ready <tab_id>`), if any.
+HYDRATE_TAB=""
+# Seconds to wait for a hydrate file's `herdr-sessionizer --ready`.
+HYDRATE_TIMEOUT=1
+
 hydrate() {
     if [[ ! -z $session_cmd ]]; then
         log "skipping hydrate for $1 -- using \"$session_cmd\" instead"
         return
     elif [ -f "$2/$HYDRATE_FILE_NAME" ]; then
         log "sourcing(local) $2/$HYDRATE_FILE_NAME"
-        pane_run "$1" "source $(printf '%q' "$2/$HYDRATE_FILE_NAME")"
+        run_hydrate_file "$1" "$2/$HYDRATE_FILE_NAME"
     elif [ -f "$HOME/$HYDRATE_FILE_NAME" ]; then
         log "sourcing(global) $HOME/$HYDRATE_FILE_NAME"
-        pane_run "$1" "source $(printf '%q' "$HOME/$HYDRATE_FILE_NAME")"
+        run_hydrate_file "$1" "$HOME/$HYDRATE_FILE_NAME"
     fi
+}
+
+# Source hydrate file $2 in pane $1 and wait until it runs `herdr-sessionizer --ready
+# [tab_id]` (at most HYDRATE_TIMEOUT seconds), so the switch can land on a tab it made.
+# The file is sourced asynchronously in the pane's shell, and a tab it creates must not
+# take focus (focus moves every attached client), so it reports the tab instead.
+# HS_READY is exported, not a `VAR=x source` prefix: zsh does not pass that to children.
+run_hydrate_file() {
+    local pane_id="$1" file="$2" fifo line
+    if ! fifo=$(mktemp -u "${TMPDIR:-/tmp}/herdr-sessionizer-ready.XXXXXX") || ! mkfifo -m 600 "$fifo"; then
+        pane_run "$pane_id" "source $(printf '%q' "$file")"
+        return
+    fi
+    # Read-write: opening does not block, and the FIFO always has a reader while it exists.
+    exec 3<>"$fifo"
+    trap "rm -f $(printf '%q' "$fifo")" EXIT
+    pane_run "$pane_id" "export HS_READY=$(printf '%q' "$fifo"); source $(printf '%q' "$file"); unset HS_READY"
+    if read -r -t "$HYDRATE_TIMEOUT" -u 3 line; then
+        HYDRATE_TAB=$line
+        log "hydrate: ready tab=$line"
+    else
+        log "hydrate: no --ready within ${HYDRATE_TIMEOUT}s"
+    fi
+    rm -f "$fifo"
+    trap - EXIT
+    exec 3<&-
 }
 
 # Focus pane $1 without moving attached clients. pane.focus is applied to all clients,
@@ -752,4 +805,4 @@ if [[ -z $workspace_id ]]; then
     hydrate "$(jq -r '.result.root_pane.pane_id' <<<"$response")" "$selected"
 fi
 
-switch_to "$workspace_id"
+switch_to "$workspace_id" "$HYDRATE_TAB"
