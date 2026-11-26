@@ -1,0 +1,643 @@
+#!/usr/bin/env bash
+# herdr-sessionizer: a herdr port of tmux-sessionizer.
+#
+# Concept mapping (tmux -> herdr):
+#   session -> workspace (matched by label)
+#   window  -> tab
+#   pane    -> pane
+CONFIG_FILE_NAME="herdr-sessionizer.conf"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-sessionizer"
+CONFIG_FILE="$CONFIG_DIR/$CONFIG_FILE_NAME"
+PANE_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/herdr-sessionizer"
+PANE_CACHE_FILE="$PANE_CACHE_DIR/panes.cache"
+HYDRATE_FILE_NAME=".herdr-sessionizer"
+# Per-terminal markers used to restart a client in place (see attach_loop).
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/herdr-sessionizer"
+# tmux-sessionizer ran session commands in window 69+idx; the tab label keeps that number.
+SESSION_CMD_BASE_INDEX=69
+
+# config file example
+# ------------------------
+# # file: ~/.config/herdr-sessionizer/herdr-sessionizer.conf
+# # If set this override the default TS_SEARCH_PATHS (~/ ~/personal ~/personal/dev/env/.config)
+# TS_SEARCH_PATHS=(~/)
+# # If set this add additional search paths to the default TS_SEARCH_PATHS
+# # The number prefix is the depth for the Path [OPTIONAL]
+# TS_EXTRA_SEARCH_PATHS=(~/ghq:3 ~/Git:3 ~/.config:2)
+# # if set this override the TS_MAX_DEPTH (1)
+# TS_MAX_DEPTH=2
+#
+# A list of commands to run in tabs labeled 69, 70, ... (one per index), so they
+# do not interfere with the tabs you create yourself.
+#
+# how to use:
+# herdr-sessionizer -s 0 will execute the first command in the tab labeled 69.
+# TS_SESSION_COMMANDS=(<cmd1> <cmd2>)
+#
+# TS_LOG=file | echo # file will write logs to TS_LOG_FILE, echo will write to stdout
+# TS_LOG_FILE=<file> # Defaults to ~/.local/share/herdr-sessionizer/herdr-sessionizer.logs
+# ------------------------
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+fi
+
+if [[ -f "$CONFIG_FILE_NAME" ]]; then
+    source "$CONFIG_FILE_NAME"
+fi
+
+if [[ $TS_LOG != "true" ]]; then
+    if [[ -z $TS_LOG_FILE ]]; then
+        TS_LOG_FILE="$HOME/.local/share/herdr-sessionizer/herdr-sessionizer.logs"
+    fi
+
+    mkdir -p "$(dirname "$TS_LOG_FILE")"
+fi
+
+log() {
+    if [[ -z $TS_LOG ]]; then
+        return
+    elif [[ $TS_LOG == "echo" ]]; then
+        echo "$*"
+    elif [[ $TS_LOG == "file" ]]; then
+        echo "$*" >> "$TS_LOG_FILE"
+    fi
+}
+
+session_idx=""
+session_cmd=""
+user_selected=""
+split_type=""
+VERSION="0.1.0"
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+    -h | --help)
+        echo "Usage: herdr-sessionizer [OPTIONS] [SEARCH_PATH]"
+        echo "Options:"
+        echo "  -h, --help             Display this help message"
+        echo "  -s, --session <name>   session command index."
+        echo "  --vsplit               Create vertical split (horizontal layout) for session command"
+        echo "  --hsplit               Create horizontal split (vertical layout) for session command"
+        exit 0
+        ;;
+    -s | --session)
+        session_idx="$2"
+        if [[ -z $session_idx ]]; then
+            echo "Session index cannot be empty"
+            exit 1
+        fi
+
+        if [[ -z $TS_SESSION_COMMANDS ]]; then
+            echo "TS_SESSION_COMMANDS is not set.  Must have a command set to run when switching to a session"
+            exit 1
+        fi
+
+        if [[ -z "$session_idx" || "$session_idx" -lt 0 || "$session_idx" -ge "${#TS_SESSION_COMMANDS[@]}" ]]; then
+            echo "Error: Invalid index. Please provide an index between 0 and $((${#TS_SESSION_COMMANDS[@]} - 1))."
+            exit 1
+        fi
+
+        session_cmd="${TS_SESSION_COMMANDS[$session_idx]}"
+
+        shift
+        ;;
+    --vsplit)
+        split_type="vsplit"
+        ;;
+    --hsplit)
+        split_type="hsplit"
+        ;;
+    -v | --version)
+        echo "herdr-sessionizer version $VERSION"
+        exit 0
+        ;;
+    *)
+        user_selected="$1"
+        ;;
+    esac
+    shift
+done
+
+log "herdr-sessionizer($VERSION): idx=$session_idx cmd=$session_cmd user_selected=$user_selected split_type=$split_type log=$TS_LOG log_file=$TS_LOG_FILE"
+
+# Validate split options are only used with session commands
+if [[ -n "$split_type" && -z "$session_idx" ]]; then
+    echo "Error: --vsplit and --hsplit can only be used with -s/--session option"
+    exit 1
+fi
+
+sanity_check() {
+    if ! command -v herdr &>/dev/null; then
+        echo "herdr is not installed. Please install it first."
+        exit 1
+    fi
+
+    if ! command -v fzf &>/dev/null; then
+        echo "fzf is not installed. Please install it first."
+        exit 1
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        echo "jq is not installed. Please install it first."
+        exit 1
+    fi
+}
+
+# True when running inside a herdr-managed pane (equivalent of $TMUX being set).
+in_herdr() {
+    [[ "$HERDR_ENV" == "1" ]]
+}
+
+# The herdr CLI does not start a server on its own; API calls fail with
+# server_not_running instead.
+is_herdr_running() {
+    herdr workspace list &>/dev/null
+}
+
+# Equivalent of tmux starting its server implicitly on `new-session -d`.
+start_herdr_server() {
+    log "starting herdr server"
+    nohup herdr server &>/dev/null &
+    disown
+    for _ in {1..40}; do
+        is_herdr_running && return 0
+        sleep 0.25
+    done
+    echo "Error: failed to start the herdr server."
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Per-client switching (equivalent of tmux switch-client / attach-session)
+#
+# herdr (0.9.5) applies every CLI/socket focus request (workspace/tab/pane focus)
+# to ALL attached clients. To move only the client that ran this script:
+#   1. silent_focus: move the server's focus without moving any attached client.
+#      `layout.apply` with focus:true is not broadcast to clients.
+#   2. New clients start at the server's focus, so:
+#      - outside herdr: attach a client (attach_loop)
+#      - inside herdr:  restart the calling client (find_calling_client,
+#        restart_calling_client); attach_loop relaunches it on the reattach flag.
+# ---------------------------------------------------------------------------
+
+# Socket of the session the herdr CLI talks to (HERDR_SOCKET_PATH inside panes,
+# otherwise derived from HERDR_SESSION like the CLI does).
+if [[ -n $HERDR_SOCKET_PATH ]]; then
+    HERDR_SOCKET="$HERDR_SOCKET_PATH"
+elif [[ -n $HERDR_SESSION && $HERDR_SESSION != "default" ]]; then
+    HERDR_SOCKET="$HOME/.config/herdr/sessions/$HERDR_SESSION/herdr.sock"
+else
+    HERDR_SOCKET="$HOME/.config/herdr/herdr.sock"
+fi
+
+# Send one raw socket API request (used only where the CLI has no equivalent).
+# Every external process costs 10-30ms, so the hot paths below avoid extra ones.
+api() {
+    printf '%s\n' "$1" | nc -U -w 1 "$HERDR_SOCKET"
+}
+
+# Move the server's focus to workspace $1 (and tab $2, default: the workspace's
+# active tab) without moving any attached client.
+# layout.apply creates a temporary tab with focus; the temporary tab is moved
+# right after the target tab and closed, so the server focus lands on the target tab
+# (closing a tab before the active one focuses the previous tab).
+silent_focus() {
+    local workspace_id="$1" tab_id="$2" tab_index response temp_tab
+    # herdr ids (w1, w1:t2) need no JSON escaping.
+    tab_index=$({ herdr workspace get "$workspace_id"; herdr tab list --workspace "$workspace_id"; } 2>/dev/null |
+        jq -rs --arg t "$tab_id" '
+            (if $t == "" then .[0].result.workspace.active_tab_id else $t end) as $target
+            | [.[1].result.tabs[].tab_id] | index($target) // empty')
+
+    response=$(api "{\"id\":\"hs-focus\",\"method\":\"layout.apply\",\"params\":{\"workspace_id\":\"$workspace_id\",\"focus\":true,\"root\":{\"type\":\"pane\",\"command\":[\"sleep\",\"30\"]}}}")
+    # The first tab_id in the response is .result.layout.tab_id.
+    if [[ $response =~ \"tab_id\":\"([^\"]+)\" ]]; then
+        temp_tab=${BASH_REMATCH[1]}
+    else
+        log "silent_focus: layout.apply failed: $response"
+        return 1
+    fi
+
+    if [[ -n $tab_index ]]; then
+        api "{\"id\":\"hs-move\",\"method\":\"tab.move\",\"params\":{\"tab_id\":\"$temp_tab\",\"insert_index\":$((tab_index + 1))}}" >/dev/null
+    fi
+    herdr tab close "$temp_tab" >/dev/null
+    log "silent_focus: workspace=$workspace_id tab=$tab_id"
+}
+
+tty_key() {
+    echo "${1##*/}"
+}
+
+# Outside herdr: run the client in a loop instead of `exec herdr`, so that a client
+# started here can be restarted in place by restart_calling_client.
+attach_loop() {
+    local tty_path key marker flag
+    if ! tty_path=$(tty 2>/dev/null); then
+        exec herdr
+    fi
+    key=$(tty_key "$tty_path")
+    mkdir -p "$STATE_DIR"
+    marker="$STATE_DIR/attach.$key"
+    flag="$STATE_DIR/reattach.$key"
+    echo "$$" > "$marker"
+    # Expand now: the local variables no longer exist when the EXIT trap runs.
+    trap "rm -f $(printf '%q' "$marker") $(printf '%q' "$flag")" EXIT
+
+    while :; do
+        rm -f "$flag"
+        log "attaching to herdr (tty=$key)"
+        herdr
+        [[ -e $flag ]] || break
+    done
+}
+
+# Inside herdr: find the client that ran this script.
+# The Enter that confirmed the selection was read by the calling client from its
+# terminal and then by this script's terminal (the herdr pane) a few ms later, so the
+# calling client is the one whose terminal read input at (almost) the same time as ours.
+# Only clients started by attach_loop (which leave a marker per terminal) are
+# candidates; if none matches, the caller is some other client and nothing is restarted.
+# Sets CALLER_KEY (terminal name) and CALLER_LOOP_PID.
+find_calling_client() {
+    local marker ttys=() own_tty atime path own_atime="" newest_atime=0 newest="" loop_pid
+    own_tty=$(tty 2>/dev/null) || {
+        log "reattach: no terminal to compare input time with"
+        return 1
+    }
+    for marker in "$STATE_DIR"/attach.*; do
+        [[ -e $marker ]] && ttys+=("/dev/${marker##*/attach.}")
+    done
+    if [[ ${#ttys[@]} -eq 0 ]]; then
+        log "reattach: no client started by herdr-sessionizer"
+        return 1
+    fi
+
+    # One stat call: our terminal first, then the candidates.
+    # "%Fa" is "<seconds>.<9 digit fraction>"; without the dot it is nanoseconds.
+    while read -r atime path; do
+        atime=${atime/./}
+        if [[ -z $own_atime ]]; then
+            own_atime=$atime
+        elif (( atime > newest_atime )); then
+            newest_atime=$atime
+            newest=$path
+        fi
+    done < <(stat -f '%Fa %N' "$own_tty" "${ttys[@]}" 2>/dev/null)
+
+    log "reattach: newest candidate $newest read input $(( (own_atime - newest_atime) / 1000000 ))ms before our terminal"
+    # The calling client reads the key a few ms before our terminal does.
+    if [[ -z $newest ]] || (( newest_atime < own_atime - 200000000 )); then
+        log "reattach: the calling client was not started by herdr-sessionizer"
+        return 1
+    fi
+
+    CALLER_KEY=$(tty_key "$newest")
+    read -r loop_pid < "$STATE_DIR/attach.$CALLER_KEY" 2>/dev/null
+    if [[ -z $loop_pid ]] || ! kill -0 "$loop_pid" 2>/dev/null; then
+        log "reattach: stale marker for $CALLER_KEY"
+        rm -f "$STATE_DIR/attach.$CALLER_KEY"
+        return 1
+    fi
+    CALLER_LOOP_PID=$loop_pid
+}
+
+# Restart the client found by find_calling_client; its attach_loop relaunches it,
+# and the new client attaches at the server focus.
+restart_calling_client() {
+    log "reattach: restarting client on $CALLER_KEY (loop $CALLER_LOOP_PID)"
+    : > "$STATE_DIR/reattach.$CALLER_KEY"
+    pkill -TERM -P "$CALLER_LOOP_PID" -x herdr
+}
+
+# Equivalent of tmux switch-client (inside) / attach-session (outside).
+# $1 workspace id, $2 optional tab id.
+switch_to() {
+    local workspace_id="$1" tab_id="$2"
+    log "switching to workspace=$workspace_id tab=$tab_id"
+
+    if in_herdr; then
+        # Already there: nothing to do (like switching tmux to the current session).
+        if [[ $workspace_id == "$HERDR_WORKSPACE_ID" && ( -z $tab_id || $tab_id == "$HERDR_TAB_ID" ) ]]; then
+            return
+        fi
+        if find_calling_client && silent_focus "$workspace_id" "$tab_id"; then
+            restart_calling_client
+            return
+        fi
+        # Fallback: herdr moves every attached client.
+        log "per-client switch unavailable; focusing on all clients"
+        if [[ -n $tab_id ]]; then
+            herdr tab focus "$tab_id" >/dev/null
+        else
+            herdr workspace focus "$workspace_id" >/dev/null
+        fi
+    else
+        silent_focus "$workspace_id" "$tab_id" || herdr workspace focus "$workspace_id" >/dev/null
+        attach_loop
+    fi
+}
+
+workspace_id_by_label() {
+    herdr workspace list 2>/dev/null |
+        jq -r --arg label "$1" 'first(.result.workspaces[] | select(.label == $label) | .workspace_id) // empty'
+}
+
+# Equivalent of `tmux display-message -p '#S'`: the caller's workspace inside herdr,
+# otherwise the focused one.
+current_workspace_id() {
+    if [[ -n $HERDR_WORKSPACE_ID ]]; then
+        echo "$HERDR_WORKSPACE_ID"
+    else
+        herdr workspace list 2>/dev/null |
+            jq -r '.result.workspaces[] | select(.focused) | .workspace_id' |
+            head -n 1
+    fi
+}
+
+# Run a command line in a pane's shell. The leading space keeps it out of the
+# shell history (zsh HIST_IGNORE_SPACE).
+pane_run() {
+    herdr pane run "$1" " $2" >/dev/null
+}
+
+hydrate() {
+    if [[ ! -z $session_cmd ]]; then
+        log "skipping hydrate for $1 -- using \"$session_cmd\" instead"
+        return
+    elif [ -f "$2/$HYDRATE_FILE_NAME" ]; then
+        log "sourcing(local) $2/$HYDRATE_FILE_NAME"
+        pane_run "$1" "source $(printf '%q' "$2/$HYDRATE_FILE_NAME")"
+    elif [ -f "$HOME/$HYDRATE_FILE_NAME" ]; then
+        log "sourcing(global) $HOME/$HYDRATE_FILE_NAME"
+        pane_run "$1" "source $(printf '%q' "$HOME/$HYDRATE_FILE_NAME")"
+    fi
+}
+
+# Focus pane $1 without moving attached clients. pane.focus is applied to all clients,
+# but pane.focus_direction is not (it also moves the server focus to the pane's tab).
+# So find a neighbor of the pane and move focus from that neighbor back to the pane.
+focus_pane_silent() {
+    local pane_id="$1" direction opposite neighbor focused
+    for direction in left right up down; do
+        case $direction in
+        left) opposite=right ;;
+        right) opposite=left ;;
+        up) opposite=down ;;
+        down) opposite=up ;;
+        esac
+        neighbor=$(herdr pane neighbor --direction "$direction" --pane "$pane_id" 2>/dev/null |
+            jq -r '.result.neighbor.neighbor_pane_id // empty')
+        [[ -z $neighbor ]] && continue
+        focused=$(api "$(jq -cn --arg p "$neighbor" --arg d "$opposite" \
+            '{id:"hs-pane-focus",method:"pane.focus_direction",params:{pane_id:$p,direction:$d}}')" |
+            jq -r '.result.focus.focused_pane_id // empty')
+        [[ $focused == "$pane_id" ]] && return 0
+    done
+    return 1
+}
+
+pane_tab_id() {
+    herdr pane get "$1" 2>/dev/null | jq -r '.result.pane.tab_id // empty'
+}
+
+live_pane_ids() {
+    herdr pane list 2>/dev/null | jq -r '.result.panes[].pane_id'
+}
+
+# Pane cache line format: "<workspace_id> <session_idx> <split_type> <pane_id>".
+# herdr pane ids contain ':' (e.g. w1:p2), so fields are space separated.
+# The workspace id scopes each entry, so a split pane created in one workspace is
+# never reused from another one (tmux-sessionizer keyed only by idx and split type).
+init_pane_cache() {
+    mkdir -p "$PANE_CACHE_DIR"
+    touch "$PANE_CACHE_FILE"
+}
+
+get_pane_id() {
+    local workspace_id="$1"
+    local session_idx="$2"
+    local split_type="$3"
+    init_pane_cache
+    awk -v w="$workspace_id" -v i="$session_idx" -v s="$split_type" \
+        '$1 == w && $2 == i && $3 == s { print $4 }' "$PANE_CACHE_FILE"
+}
+
+set_pane_id() {
+    local workspace_id="$1"
+    local session_idx="$2"
+    local split_type="$3"
+    local pane_id="$4"
+    init_pane_cache
+
+    # Remove existing entry if it exists
+    awk -v w="$workspace_id" -v i="$session_idx" -v s="$split_type" \
+        '!($1 == w && $2 == i && $3 == s)' "$PANE_CACHE_FILE" > "${PANE_CACHE_FILE}.tmp"
+    mv "${PANE_CACHE_FILE}.tmp" "$PANE_CACHE_FILE"
+
+    # Add new entry
+    echo "$workspace_id $session_idx $split_type $pane_id" >> "$PANE_CACHE_FILE"
+}
+
+cleanup_dead_panes() {
+    init_pane_cache
+    local temp_file="${PANE_CACHE_FILE}.tmp"
+    local live
+    live="$(live_pane_ids)"
+
+    : > "$temp_file"
+    while read -r workspace_id idx split pane_id; do
+        if grep -qxF "$pane_id" <<<"$live"; then
+            echo "${workspace_id} ${idx} ${split} ${pane_id}" >> "$temp_file"
+        fi
+    done < "$PANE_CACHE_FILE"
+
+    mv "$temp_file" "$PANE_CACHE_FILE" 2>/dev/null || touch "$PANE_CACHE_FILE"
+}
+
+pane_exists() {
+    live_pane_ids | grep -qxF "$1"
+}
+
+sanity_check
+
+# if TS_SEARCH_PATHS is not set use default
+[[ -n "$TS_SEARCH_PATHS" ]] || TS_SEARCH_PATHS=(~/ ~/personal ~/personal/dev/env/.config)
+
+# Add any extra search paths to the TS_SEARCH_PATHS array
+# e.g : EXTRA_SEARCH_PATHS=("$HOME/extra1:4" "$HOME/extra2")
+# note : Path can be suffixed with :number to limit or extend the depth of the search for the Path
+
+if [[ ${#TS_EXTRA_SEARCH_PATHS[@]} -gt 0 ]]; then
+    TS_SEARCH_PATHS+=("${TS_EXTRA_SEARCH_PATHS[@]}")
+fi
+
+# utility function to find directories
+find_dirs() {
+    # list herdr workspaces (excluding the caller's own workspace inside herdr).
+    # Prints nothing when the server is not running (the error goes to stderr).
+    local current=""
+    in_herdr && current="$HERDR_WORKSPACE_ID"
+    herdr workspace list 2>/dev/null |
+        jq -r --arg current "$current" \
+            '.result.workspaces[]? | select(.workspace_id != $current and .label != null) | "[HERDR] \(.label)"' 2>/dev/null
+
+    # note: TS_SEARCH_PATHS is an array of paths to search for directories
+    # if the path ends with :number, it will search for directories with a max depth of number ;)
+    # if there is no number, it will search for directories with a max depth defined by TS_MAX_DEPTH or 1 if not set
+    for entry in "${TS_SEARCH_PATHS[@]}"; do
+        # Check if entry as :number as suffix then adapt the maxdepth parameter
+        if [[ "$entry" =~ ^([^:]+):([0-9]+)$ ]]; then
+            path="${BASH_REMATCH[1]}"
+            depth="${BASH_REMATCH[2]}"
+        else
+            path="$entry"
+        fi
+
+        [[ -d "$path" ]] && find "$path" -mindepth 1 -maxdepth "${depth:-${TS_MAX_DEPTH:-1}}" -path '*/.git' -prune -o -type d -print
+    done
+}
+
+# Equivalent of `find_dirs | fzf`, but returns as soon as fzf exits.
+# A pipeline waits for every command, so a find blocked on a hung mount (e.g. a hard
+# NFS mount) kept the script waiting after the selection. Here the search runs as a
+# background job in its own process group, which is killed once fzf is done.
+# (bash 3.2 on macOS: no $! for process substitution, so a FIFO is used.)
+select_dir() {
+    local fifo finder_pid choice
+    if ! fifo=$(mktemp -u "${TMPDIR:-/tmp}/herdr-sessionizer.XXXXXX") || ! mkfifo -m 600 "$fifo"; then
+        find_dirs | fzf
+        return
+    fi
+    set -m # job control: give the background job its own process group
+    find_dirs > "$fifo" < /dev/null &
+    finder_pid=$!
+    set +m
+    # The job is outside the terminal's foreground group, so it gets no SIGHUP when
+    # the terminal closes. select_dir runs in a $(...) subshell, so the trap is local.
+    # A process blocked in uninterruptible I/O exits when the I/O returns.
+    trap "kill -TERM -- -$finder_pid 2>/dev/null; rm -f $(printf '%q' "$fifo")" EXIT
+    trap 'exit 129' HUP
+    trap 'exit 143' TERM
+    choice=$(fzf < "$fifo")
+    printf '%s\n' "$choice"
+}
+
+handle_session_cmd() {
+    log "executing session command $session_cmd with index $session_idx split_type=$split_type"
+    if ! is_herdr_running; then
+        echo "Error: herdr is not running.  Please start herdr first before using session commands."
+        exit 1
+    fi
+
+    current_workspace=$(current_workspace_id)
+
+    if [[ -n "$split_type" ]]; then
+        handle_split_session_cmd "$current_workspace"
+    else
+        handle_window_session_cmd "$current_workspace"
+    fi
+    exit 0
+}
+
+handle_window_session_cmd() {
+    local current_workspace="$1"
+    local label=$((SESSION_CMD_BASE_INDEX + session_idx))
+    local tab_id pane_id
+
+    tab_id=$(herdr tab list --workspace "$current_workspace" 2>/dev/null |
+        jq -r --arg label "$label" '.result.tabs[] | select(.label == $label) | .tab_id' |
+        head -n 1)
+
+    log "target: $current_workspace tab label $label command $session_cmd existing_tab=$tab_id"
+    if [[ -z $tab_id ]]; then
+        # `exec` makes the command the pane's process: the tab closes when it exits
+        # and the command is killed when the tab is closed, like `tmux neww <cmd>`.
+        local response
+        response=$(herdr tab create --workspace "$current_workspace" --cwd "$PWD" --label "$label")
+        tab_id=$(jq -r '.result.tab.tab_id // empty' <<<"$response")
+        pane_id=$(jq -r '.result.root_pane.pane_id // empty' <<<"$response")
+        log "executing session command in tab $label pane $pane_id: $session_cmd"
+        pane_run "$pane_id" "exec $session_cmd"
+    fi
+    switch_to "$current_workspace" "$tab_id"
+}
+
+handle_split_session_cmd() {
+    local current_workspace="$1"
+    cleanup_dead_panes
+
+    # Check if pane already exists
+    local existing_pane_id=$(get_pane_id "$current_workspace" "$session_idx" "$split_type")
+
+    if [[ -n "$existing_pane_id" ]] && pane_exists "$existing_pane_id"; then
+        log "switching to existing pane $existing_pane_id"
+        local pane_tab
+        pane_tab=$(pane_tab_id "$existing_pane_id")
+        if focus_pane_silent "$existing_pane_id" && in_herdr && [[ $pane_tab == "$HERDR_TAB_ID" ]]; then
+            # The pane is in the tab this client is viewing: focus within a tab is shared,
+            # so the client already shows it.
+            return
+        fi
+        switch_to "$current_workspace" "$pane_tab"
+    else
+        # Create new split
+        local direction=""
+        if [[ "$split_type" == "vsplit" ]]; then
+            direction="right"  # horizontal layout (vertical split), tmux split-window -h
+        else
+            direction="down"   # vertical layout (horizontal split), tmux split-window -v
+        fi
+
+        log "creating new split: herdr pane split --direction $direction --cwd $(pwd) ($session_cmd)"
+        local new_pane_id=$(herdr pane split --direction "$direction" --cwd "$(pwd)" --focus |
+            jq -r '.result.pane.pane_id // empty')
+
+        if [[ -n "$new_pane_id" ]]; then
+            pane_run "$new_pane_id" "exec $session_cmd"
+            set_pane_id "$current_workspace" "$session_idx" "$split_type" "$new_pane_id"
+            log "created pane $new_pane_id for workspace=$current_workspace session_idx=$session_idx split_type=$split_type"
+        fi
+    fi
+}
+
+if [[ ! -z $session_cmd ]]; then
+    handle_session_cmd
+elif [[ ! -z $user_selected ]]; then
+    selected="$user_selected"
+else
+    selected=$(select_dir)
+fi
+
+if [[ -z $selected ]]; then
+    exit 0
+fi
+
+if [[ "$selected" =~ ^\[HERDR\]\ (.+)$ ]]; then
+    selected="${BASH_REMATCH[1]}"
+fi
+
+# herdr labels have no tmux session-name restrictions, so the directory name is used as is.
+selected_name=$(basename "$selected")
+
+if ! is_herdr_running; then
+    start_herdr_server
+fi
+
+workspace_id=$(workspace_id_by_label "$selected_name")
+
+if [[ -z $workspace_id ]]; then
+    # herdr resolves --cwd on the server side, so pass an absolute path.
+    [[ -d "$selected" ]] && selected="$(cd "$selected" && pwd)"
+    response=$(herdr workspace create --cwd "$selected" --label "$selected_name")
+    workspace_id=$(jq -r '.result.workspace.workspace_id // empty' <<<"$response")
+    if [[ -z $workspace_id ]]; then
+        echo "Error: failed to create workspace for $selected"
+        echo "$response"
+        exit 1
+    fi
+    hydrate "$(jq -r '.result.root_pane.pane_id' <<<"$response")" "$selected"
+fi
+
+switch_to "$workspace_id"
