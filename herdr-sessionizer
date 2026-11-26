@@ -158,8 +158,9 @@ is_herdr_running() {
 # Equivalent of tmux starting its server implicitly on `new-session -d`.
 start_herdr_server() {
     log "starting herdr server"
-    nohup herdr server &>/dev/null &
-    disown
+    # Start it outside this process tree: attach_loop runs in this process, and
+    # restart_calling_client kills the loop's herdr children.
+    (nohup herdr server &>/dev/null &)
     for _ in {1..40}; do
         is_herdr_running && return 0
         sleep 0.25
@@ -308,7 +309,8 @@ find_calling_client() {
 restart_calling_client() {
     log "reattach: restarting client on $CALLER_KEY (loop $CALLER_LOOP_PID)"
     : > "$STATE_DIR/reattach.$CALLER_KEY"
-    pkill -TERM -P "$CALLER_LOOP_PID" -x herdr
+    # Full command line "herdr": the client only, never a `herdr server`.
+    pkill -TERM -P "$CALLER_LOOP_PID" -fx herdr
 }
 
 # Equivalent of tmux switch-client (inside) / attach-session (outside).
