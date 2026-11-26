@@ -192,10 +192,47 @@ else
     HERDR_SOCKET="$HOME/.config/herdr/herdr.sock"
 fi
 
+# Unix socket client for api(). macOS ships a BSD nc with -U. Linux nc variants
+# differ (GNU netcat has no -U) and are often not installed, so socat or python3
+# is used there.
+if [[ $OSTYPE == darwin* ]]; then
+    API_CLIENT=nc
+elif command -v socat &>/dev/null; then
+    API_CLIENT=socat
+elif command -v python3 &>/dev/null; then
+    API_CLIENT=python3
+else
+    API_CLIENT=nc
+fi
+
 # Send one raw socket API request (used only where the CLI has no equivalent).
 # Every external process costs 10-30ms, so the hot paths below avoid extra ones.
 api() {
-    printf '%s\n' "$1" | nc -U -w 1 "$HERDR_SOCKET"
+    case $API_CLIENT in
+    socat)
+        printf '%s\n' "$1" | socat -t 1 - "UNIX-CONNECT:$HERDR_SOCKET"
+        ;;
+    python3)
+        # The response is one JSON line.
+        python3 -I -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(2)
+s.connect(sys.argv[1])
+s.sendall(sys.argv[2].encode() + b"\n")
+buf = b""
+while not buf.endswith(b"\n"):
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+sys.stdout.write(buf.decode())
+' "$HERDR_SOCKET" "$1"
+        ;;
+    *)
+        printf '%s\n' "$1" | nc -U -w 1 "$HERDR_SOCKET"
+        ;;
+    esac
 }
 
 # Move the server's focus to workspace $1 (and tab $2, default: the workspace's
@@ -255,14 +292,32 @@ attach_loop() {
 }
 
 # Inside herdr: find the client that ran this script.
-# The Enter that confirmed the selection was read by the calling client from its
-# terminal and then by this script's terminal (the herdr pane) a few ms later, so the
-# calling client is the one whose terminal read input at (almost) the same time as ours.
 # Only clients started by attach_loop (which leave a marker per terminal) are
 # candidates; if none matches, the caller is some other client and nothing is restarted.
 # Sets CALLER_KEY (terminal name) and CALLER_LOOP_PID.
 find_calling_client() {
-    local marker ttys=() own_tty atime path own_atime="" newest_atime=0 newest="" loop_pid
+    local loop_pid
+    if [[ -r /proc/self/io ]]; then
+        find_caller_by_input || return 1
+    else
+        find_caller_by_atime || return 1
+    fi
+
+    read -r loop_pid < "$STATE_DIR/attach.$CALLER_KEY" 2>/dev/null
+    if [[ -z $loop_pid ]] || ! kill -0 "$loop_pid" 2>/dev/null; then
+        log "reattach: stale marker for $CALLER_KEY"
+        rm -f "$STATE_DIR/attach.$CALLER_KEY"
+        return 1
+    fi
+    CALLER_LOOP_PID=$loop_pid
+}
+
+# macOS: the Enter that confirmed the selection was read by the calling client from
+# its terminal and then by this script's terminal (the herdr pane) a few ms later, so
+# the calling client is the one whose terminal read input at (almost) the same time as
+# ours. Uses the BSD stat format.
+find_caller_by_atime() {
+    local marker ttys=() own_tty atime path own_atime="" newest_atime=0 newest=""
     own_tty=$(tty 2>/dev/null) || {
         log "reattach: no terminal to compare input time with"
         return 1
@@ -295,13 +350,67 @@ find_calling_client() {
     fi
 
     CALLER_KEY=$(tty_key "$newest")
-    read -r loop_pid < "$STATE_DIR/attach.$CALLER_KEY" 2>/dev/null
-    if [[ -z $loop_pid ]] || ! kill -0 "$loop_pid" 2>/dev/null; then
-        log "reattach: stale marker for $CALLER_KEY"
-        rm -f "$STATE_DIR/attach.$CALLER_KEY"
+}
+
+# Linux: terminal access times are updated only every few seconds (the kernel hides
+# keystroke timing), so input is detected with the clients' read byte counters
+# (/proc/<pid>/io rchar) instead. A herdr client gets server updates over its socket
+# (recv, not counted), so its rchar grows only when it reads its terminal (or a file).
+# snapshot_client_input records the counters before fzf; afterwards the calling
+# client is the one that read the most input since then. Without a snapshot (-s or a
+# path argument: nothing is typed while the script runs) the caller is unknown.
+CLIENT_INPUT_SNAPSHOT=()
+
+# Sets RCHAR to the rchar counter of process $1.
+read_rchar() {
+    local key value
+    RCHAR=""
+    [[ -r /proc/$1/io ]] || return 1
+    while read -r key value; do
+        if [[ $key == rchar: ]]; then
+            RCHAR=$value
+            return 0
+        fi
+    done < "/proc/$1/io"
+    return 1
+}
+
+snapshot_client_input() {
+    local marker key loop_pid pid
+    in_herdr && [[ -r /proc/self/io ]] || return 0
+    for marker in "$STATE_DIR"/attach.*; do
+        [[ -e $marker ]] || continue
+        key=${marker##*/attach.}
+        read -r loop_pid < "$marker" 2>/dev/null
+        [[ -n $loop_pid ]] || continue
+        read -r pid < <(pgrep -P "$loop_pid" -fx herdr)
+        if [[ -n $pid ]] && read_rchar "$pid"; then
+            CLIENT_INPUT_SNAPSHOT+=("$key $pid $RCHAR")
+        fi
+    done
+}
+
+find_caller_by_input() {
+    local entry key pid before read_bytes best=0 best_key=""
+    if [[ ${#CLIENT_INPUT_SNAPSHOT[@]} -eq 0 ]]; then
+        log "reattach: no input snapshot of clients started by herdr-sessionizer"
         return 1
     fi
-    CALLER_LOOP_PID=$loop_pid
+    for entry in "${CLIENT_INPUT_SNAPSHOT[@]}"; do
+        read -r key pid before <<<"$entry"
+        read_rchar "$pid" || continue
+        read_bytes=$((RCHAR - before))
+        log "reattach: client on $key read $read_bytes bytes since the snapshot"
+        if (( read_bytes > best )); then
+            best=$read_bytes
+            best_key=$key
+        fi
+    done
+    if [[ -z $best_key ]]; then
+        log "reattach: the calling client was not started by herdr-sessionizer"
+        return 1
+    fi
+    CALLER_KEY=$best_key
 }
 
 # Restart the client found by find_calling_client; its attach_loop relaunches it,
@@ -609,6 +718,7 @@ if [[ ! -z $session_cmd ]]; then
 elif [[ ! -z $user_selected ]]; then
     selected="$user_selected"
 else
+    snapshot_client_input
     selected=$(select_dir)
 fi
 

@@ -13,6 +13,8 @@ tmux concepts map to herdr like this:
 ## Requirements
 fzf, herdr and jq
 
+On Linux, also socat or python3 (for socket API requests the herdr CLI has no command for).
+
 ## Usage
 ```bash
 herdr-sessionizer [<partial name of session>]
@@ -30,6 +32,11 @@ the client that ran it like this:
 - **outside herdr**: attach a client (run `herdr-sessionizer` in a terminal to start herdr).
 - **inside herdr**: restart the calling client at the selected workspace. This only works for
   clients started by herdr-sessionizer. For any other client, all attached clients move.
+
+To find the calling client, macOS compares terminal input times. Linux hides those
+(the kernel updates them only every few seconds), so the clients' read byte counters
+are compared before and after the fzf selection instead. On Linux, `-s` and a path
+argument (nothing is typed while the script runs) move all attached clients.
 
 ## Session Commands
 Session commands are for you to write / navigate without using herdr navigation commands.
