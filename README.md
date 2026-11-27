@@ -120,7 +120,9 @@ client that pressed the key, and herdr-sessionizer finds that client like it doe
 [[keys.command]]
 key = "ctrl+f"   # takes Ctrl-F from every pane (less, Claude Code, ...)
 type = "popup"
-command = "/Users/me/.local/bin/herdr-sessionizer"   # the server's PATH may not have it
+# A popup gets the herdr server's environment, so use a login shell: a server started
+# over ssh, for example, has no Homebrew in its PATH.
+command = "/bin/zsh -lc /Users/me/.local/bin/herdr-sessionizer"
 width = "100%"
 height = "100%"
 ```
