@@ -110,8 +110,23 @@ bindkey -s '\en' "herdr-sessionizer -s 2\n"
 bindkey -s '\es' "herdr-sessionizer -s 3\n"
 ```
 
-There is no herdr keybinding equivalent of the tmux `bind-key ... neww` remaps:
-a pane or tab opened by a herdr keybinding shows up on every attached client.
+**herdr**
+
+The zsh and vim remaps only work while zsh or vim has the keyboard. A herdr popup
+command works in any pane (Claude Code, lazygit, ...). The popup shows only on the
+client that pressed the key, and herdr-sessionizer finds that client like it does from a pane.
+```toml
+# file: ~/.config/herdr/config.toml
+[[keys.command]]
+key = "ctrl+f"   # takes Ctrl-F from every pane (less, Claude Code, ...)
+type = "popup"
+command = "/Users/me/.local/bin/herdr-sessionizer"   # the server's PATH may not have it
+width = "100%"
+height = "100%"
+```
+
+Do not use `type = "pane"` (or the tmux `bind-key ... neww` style): a pane or tab
+opened by a herdr keybinding shows up on every attached client.
 
 ## Enable Logs
 This is for debugging purposes.

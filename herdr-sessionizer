@@ -171,6 +171,11 @@ in_herdr() {
     [[ "$HERDR_ENV" == "1" ]]
 }
 
+# A herdr popup command ([[keys.command]] type = "popup") runs outside any pane, so
+# herdr sets HERDR_ACTIVE_* (where the client that pressed the key is) instead.
+: "${HERDR_WORKSPACE_ID:=$HERDR_ACTIVE_WORKSPACE_ID}"
+: "${HERDR_TAB_ID:=$HERDR_ACTIVE_TAB_ID}"
+
 # The herdr CLI does not start a server on its own; API calls fail with
 # server_not_running instead.
 is_herdr_running() {
